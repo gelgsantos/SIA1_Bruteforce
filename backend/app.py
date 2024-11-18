@@ -8,6 +8,7 @@ from pathlib import Path
 from zipfile import ZipFile
 from tqdm import tqdm
 import threading
+import os
 
 app = Flask(__name__)
 CORS(app)  # Allow CORS for your React frontend
@@ -139,7 +140,7 @@ def get_files():
     conn = get_db_connection()
     files = conn.execute("SELECT * FROM files").fetchall()
     conn.close()
-    return jsonify([{"id": file["id"], "filename": file["filename"], "file_path": file["file_path"], "file_type": file["file_type"]} for file in files])
+    return jsonify([{"id": file["id"], "filename": file["filename"], "file_path": file["file_path"], "file_type": file["file_type"], "bruteforce_status": file["bruteforce_status"]} for file in files])
 
 #brute force code
 # Dummy function to simulate database connection (replace with actual database logic)
@@ -149,30 +150,67 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-
-# Brute force password cracking function
 def crack_password(wordlist_path, zip_file_path, file_id):
-    zip_file = ZipFile(zip_file_path)
-    n_words = len(list(open(wordlist_path, 'rb')))
+    found_password = None  # Initialize the variable
+    
+    try:
+        zip_file = ZipFile(zip_file_path)
+    except BadZipFile:
+        print(f"[!] Invalid zip file: {zip_file_path}")
+        conn = get_db_connection()
+        conn.execute(
+            "UPDATE files SET bruteforce_status = ? WHERE id = ?",
+            ("Invalid ZIP File", file_id),
+        )
+        conn.commit()
+        conn.close()
+        return {"status": "error", "message": "Invalid ZIP file"}
+
+    # Get total number of passwords in wordlist
+    try:
+        with open(wordlist_path, 'rb') as wordlist:
+            n_words = len(list(wordlist))
+    except FileNotFoundError:
+        print(f"[!] Wordlist not found: {wordlist_path}")
+        conn = get_db_connection()
+        conn.execute(
+            "UPDATE files SET bruteforce_status = ? WHERE id = ?",
+            ("Wordlist Missing", file_id),
+        )
+        conn.commit()
+        conn.close()
+        return {"status": "error", "message": "Wordlist not found"}
 
     print('[2] Total passwords to test:', f'{n_words:,}')
+
+    # Attempt password extraction
     with open(wordlist_path, 'rb') as wordlist:
         for word in tqdm(wordlist, total=n_words, unit='word'):
             try:
                 zip_file.extractall(pwd=word.strip())
-            except:
-                continue
+            except RuntimeError as e:
+                if "Bad password" in str(e):  # Invalid password
+                    continue
+                else:  # Handle decompression or other errors
+                    print(f"[!] Skipping password {word.strip()}: {e}")
+                    continue
+            except Exception as e:  # Catch other unexpected errors
+                print(f"[!] Unexpected error with password {word.strip()}: {e}")
+                break
             else:
-                print('\n[+] Password found:', word.decode().strip())
-                # Update the database
+                # Password found
+                found_password = word.decode().strip()
+                print('\n[+] Password found:', found_password)
                 conn = get_db_connection()
                 conn.execute(
                     "UPDATE files SET bruteforce_status = ?, password = ? WHERE id = ?",
-                    ("Completed", word.decode().strip(), file_id),
+                    ("Completed", found_password, file_id),
                 )
                 conn.commit()
                 conn.close()
-                return True  # Password found
+                return {"status": "success", "password": found_password}
+
+    # If no password is found, the function reaches here
     print("\n[!] Password not found, try another wordlist.")
     conn = get_db_connection()
     conn.execute(
@@ -181,7 +219,9 @@ def crack_password(wordlist_path, zip_file_path, file_id):
     )
     conn.commit()
     conn.close()
-    return False  # Password not found
+    return {"status": "error", "message": "Password not found"}
+
+   
 
 
 @app.route("/api/bruteforce", methods=["POST"])
@@ -207,14 +247,15 @@ def bruteforce_file():
     if not zip_file_path.exists():
         return jsonify({"error": "Zip file does not exist"}), 404
 
-    # Define a thread function to perform the brute force in the background
-    def thread_func():
-        with app.app_context():  # Ensure Flask application context is available in the thread
-            crack_password(wordlist_path, zip_file_path, file_id)
+    # Call crack_password synchronously and wait for its result
+    result = crack_password(wordlist_path, zip_file_path, file_id)
 
-    # Start the thread
-    threading.Thread(target=thread_func).start()
-    return jsonify({"message": f"Started bruteforce for file ID {file_id}"}), 200
+    # Return the result directly in the response
+    return jsonify({
+        "message": f"Bruteforce completed for file ID {file_id}",
+        "result": result
+    }), 200
+
 
 if __name__ == "__main__":
     app.run(debug=True)
